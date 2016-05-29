@@ -194,7 +194,7 @@ func ({0} *{2}) {1} ({3}) {4}  {{
             return
         }}
 
-        if err = p.DecodePayload({7}); err != nil {{
+        if err = response.DecodePayload({7}); err != nil {{
             return
         }}
     }}
