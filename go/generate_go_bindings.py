@@ -121,13 +121,13 @@ func New{1} (uid tinkerforge.UID, ip *tinkerforge.IPConnection) *{1} {{
 """
 
         cb_temp = """
-\t//device_p.callback_wrappers[{3}Callback{1}] = {0}_callback_wrapper_{2};"""
+\t{0}.AddCallbackWrapper(Callback{1}, {0}.{1}Callback)"""
 
         cbs = ''
         dev_name = self.get_underscore_name()
         for packet in self.get_packets('callback'):
             type_name = packet.get_underscore_name()
-            cbs += cb_temp.format(dev_name, type_name.upper(), type_name, dev_name.upper())
+            cbs += cb_temp.format(dev_name, packet.get_camel_case_name(), type_name, dev_name.upper())
 
         response_expected = ''
 
