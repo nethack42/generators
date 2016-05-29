@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2012-2015 Matthias Bolte <matthias@tinkerforge.com>
+ * Copyright (C) 2012-2016 Matthias Bolte <matthias@tinkerforge.com>
  * Copyright (C) 2011 Olaf Lüke <olaf@tinkerforge.com>
  *
  * Redistribution and use in source and binary forms of this file,
@@ -25,6 +25,7 @@
 
 #ifdef _WIN32
 	#include <winsock2.h>
+	#include <ws2tcpip.h>
 	#include <wincrypt.h>
 	#include <process.h>
 #else
@@ -42,6 +43,9 @@
 #ifdef _MSC_VER
 	// replace getpid with GetCurrentProcessId
 	#define getpid GetCurrentProcessId
+
+	// avoid warning from MSVC about deprecated POSIX name
+	#define strdup _strdup
 #else
 	#include <sys/time.h> // gettimeofday
 #endif
@@ -250,7 +254,7 @@ static void sha1_update(SHA1 *sha1, const uint8_t *data, size_t length) {
 	size_t i, j;
 
 	j = (size_t)((sha1->count >> 3) & 63);
-	sha1->count += (length << 3);
+	sha1->count += (uint64_t)length << 3;
 
 	if ((j + length) > 63) {
 		i = 64 - j;
@@ -586,8 +590,8 @@ static void socket_destroy(Socket *socket) {
 	closesocket(socket->handle);
 }
 
-static int socket_connect(Socket *socket, struct sockaddr_in *address, int length) {
-	return connect(socket->handle, (struct sockaddr *)address, length) == SOCKET_ERROR ? -1 : 0;
+static int socket_connect(Socket *socket, struct sockaddr *address, int length) {
+	return connect(socket->handle, address, length) == SOCKET_ERROR ? -1 : 0;
 }
 
 static void socket_shutdown(Socket *socket) {
@@ -610,7 +614,7 @@ static int socket_receive(Socket *socket, void *buffer, int length) {
 	return length;
 }
 
-static int socket_send(Socket *socket, void *buffer, int length) {
+static int socket_send(Socket *socket, const void *buffer, int length) {
 	mutex_lock(&socket->send_mutex);
 
 	length = send(socket->handle, (const char *)buffer, length, 0);
@@ -653,8 +657,8 @@ static void socket_destroy(Socket *socket) {
 	close(socket->handle);
 }
 
-static int socket_connect(Socket *socket, struct sockaddr_in *address, int length) {
-	return connect(socket->handle, (struct sockaddr *)address, length);
+static int socket_connect(Socket *socket, struct sockaddr *address, int length) {
+	return connect(socket->handle, address, length);
 }
 
 static void socket_shutdown(Socket *socket) {
@@ -665,7 +669,7 @@ static int socket_receive(Socket *socket, void *buffer, int length) {
 	return recv(socket->handle, buffer, length, 0);
 }
 
-static int socket_send(Socket *socket, void *buffer, int length) {
+static int socket_send(Socket *socket, const void *buffer, int length) {
 	int rc;
 
 	mutex_lock(&socket->send_mutex);
@@ -1805,7 +1809,7 @@ static void ipcon_receive_loop(void *opaque) {
 		pending_length += length;
 
 		while (ipcon_p->receive_flag) {
-			if (pending_length < 8) {
+			if (pending_length < (int)sizeof(PacketHeader)) {
 				// wait for complete header
 				break;
 			}
@@ -1828,8 +1832,9 @@ static void ipcon_receive_loop(void *opaque) {
 
 // NOTE: assumes that socket is NULL and socket_mutex is locked
 static int ipcon_connect_unlocked(IPConnectionPrivate *ipcon_p, bool is_auto_reconnect) {
-	struct hostent *entity;
-	struct sockaddr_in address;
+	char service[32];
+	struct addrinfo hints;
+	struct addrinfo *resolved = NULL;
 	Socket *tmp;
 	uint8_t connect_reason;
 	Meta *meta;
@@ -1857,9 +1862,15 @@ static int ipcon_connect_unlocked(IPConnectionPrivate *ipcon_p, bool is_auto_rec
 	}
 
 	// create and connect socket
-	entity = gethostbyname(ipcon_p->host);
+	snprintf(service, sizeof(service), "%u", ipcon_p->port);
 
-	if (entity == NULL) {
+	memset(&hints, 0, sizeof(hints));
+
+	hints.ai_flags = AI_PASSIVE;
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_STREAM;
+
+	if (getaddrinfo(ipcon_p->host, service, &hints, &resolved) != 0) {
 		// destroy callback thread
 		if (!is_auto_reconnect) {
 			ipcon_exit_callback_thread(ipcon_p->callback);
@@ -1869,15 +1880,10 @@ static int ipcon_connect_unlocked(IPConnectionPrivate *ipcon_p, bool is_auto_rec
 		return E_HOSTNAME_INVALID;
 	}
 
-	memset(&address, 0, sizeof(struct sockaddr_in));
-	memcpy(&address.sin_addr, entity->h_addr_list[0], entity->h_length);
-
-	address.sin_family = AF_INET;
-	address.sin_port = htons(ipcon_p->port);
-
 	tmp = (Socket *)malloc(sizeof(Socket));
 
-	if (socket_create(tmp, AF_INET, SOCK_STREAM, 0) < 0) {
+	if (socket_create(tmp, resolved->ai_family, resolved->ai_socktype,
+	                  resolved->ai_protocol) < 0) {
 		// destroy callback thread
 		if (!is_auto_reconnect) {
 			ipcon_exit_callback_thread(ipcon_p->callback);
@@ -1886,11 +1892,12 @@ static int ipcon_connect_unlocked(IPConnectionPrivate *ipcon_p, bool is_auto_rec
 
 		// destroy socket
 		free(tmp);
+		freeaddrinfo(resolved);
 
 		return E_NO_STREAM_SOCKET;
 	}
 
-	if (socket_connect(tmp, &address, sizeof(address)) < 0) {
+	if (socket_connect(tmp, resolved->ai_addr, resolved->ai_addrlen) < 0) {
 		// destroy callback thread
 		if (!is_auto_reconnect) {
 			ipcon_exit_callback_thread(ipcon_p->callback);
@@ -1900,9 +1907,12 @@ static int ipcon_connect_unlocked(IPConnectionPrivate *ipcon_p, bool is_auto_rec
 		// destroy socket
 		socket_destroy(tmp);
 		free(tmp);
+		freeaddrinfo(resolved);
 
 		return E_NO_CONNECT;
 	}
+
+	freeaddrinfo(resolved);
 
 	ipcon_p->socket = tmp;
 	++ipcon_p->socket_id;
